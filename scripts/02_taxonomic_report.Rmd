@@ -1,0 +1,709 @@
+---
+title: "Taxonomic Profiling Report — Metagenomics Pipeline"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(phyloseq)
+library(vegan)
+library(patchwork)
+library(microbiome)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# USER-ADJUSTABLE PARAMETERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Decontamination thresholds
+# Ratio filter: remove taxa where mean(blank) / mean(sample) > RATIO_THRESHOLD
+RATIO_THRESHOLD <- 0.1
+
+# Span filter: remove taxa present in >= SPAN_THRESHOLD proportion of blanks
+SPAN_THRESHOLD <- 0.5
+
+# Flag samples where unclassified reads exceed this proportion
+UNCLASSIFIED_THRESHOLD <- 0.75
+
+# Number of top taxa to display in barplots
+TOP_N_TAXA <- 15
+```
+
+```{r load_config, include=FALSE}
+config_lines <- readLines("../config.sh")
+
+extract_config <- function(lines, key) {
+  line <- lines[grep(paste0("^", key, "="), lines)]
+  if (length(line) == 0) return(NA)
+  value <- gsub(paste0(key, "=|\""), "", line[1])
+  value <- gsub("#.*$", "", value)
+  trimws(value)
+}
+
+cfg_type     <- extract_config(config_lines, "TYPE")
+cfg_host_ref <- extract_config(config_lines, "HOST_REF")
+```
+
+```{r load_data, include=FALSE}
+# ── Metadata ──────────────────────────────────────────────────────────────────
+metadata_path <- "../metadata.tsv"
+if (!file.exists(metadata_path)) {
+  stop("metadata.tsv not found. Please copy it before rendering.")
+}
+metadata <- read_tsv(metadata_path, col_types = cols(.default = "c")) %>%
+  rename_with(tolower)
+
+required_cols <- c("sequence_id", "sample_name", "sample_group")
+missing_cols  <- setdiff(required_cols, colnames(metadata))
+if (length(missing_cols) > 0) {
+  stop(paste("metadata.tsv is missing columns:", paste(missing_cols, collapse = ", ")))
+}
+
+# ── Build colour palette from sample_group ────────────────────────────────────
+groups       <- unique(metadata$sample_group)
+non_blank    <- groups[groups != "blank"]
+base_colours <- c("#4E79A7", "#59A14F", "#F28E2B", "#B07AA1",
+                  "#76B7B2", "#EDC948", "#FF9DA7", "#9C755F")
+group_colours <- setNames(base_colours[seq_along(non_blank)], non_blank)
+group_colours["blank"] <- "#AAAAAA"
+
+# ── MetaPhlAn merged table ────────────────────────────────────────────────────
+merged_path <- "metaphlan_merged.tsv"
+if (!file.exists(merged_path)) {
+  stop("metaphlan_merged.tsv not found. Has 02c_metaphlan_merge completed successfully?")
+}
+metaphlan_raw <- read_tsv(merged_path, skip = 1, col_types = cols(.default = "c")) %>%
+  rename(clade = 1) %>%
+  rename_with(~ gsub("\\.unclprofile$", "", .x), -clade)
+
+# ── Parse MetaPhlAn table ─────────────────────────────────────────────────────
+# Extract unclassified row
+unclassified_row <- metaphlan_raw %>%
+  filter(grepl("^UNCLASSIFIED", clade, ignore.case = TRUE))
+
+# Keep only species-level and above rows (remove UNCLASSIFIED from main table)
+metaphlan_clean <- metaphlan_raw %>%
+  filter(!grepl("^UNCLASSIFIED", clade, ignore.case = TRUE))
+
+# Convert to numeric
+sample_cols <- setdiff(colnames(metaphlan_clean), "clade")
+metaphlan_clean <- metaphlan_clean %>%
+  mutate(across(all_of(sample_cols), as.numeric))
+
+# ── Extract taxonomy ──────────────────────────────────────────────────────────
+# MetaPhlAn clade names: k__|p__|c__|o__|f__|g__|s__
+parse_taxonomy <- function(clade_string) {
+  parts   <- str_split(clade_string, "\\|")[[1]]
+  tax_map <- list(
+    Kingdom = NA, Phylum = NA, Class = NA, Order = NA,
+    Family  = NA, Genus  = NA, Species = NA
+  )
+  for (p in parts) {
+    if (startsWith(p, "k__")) tax_map$Kingdom <- gsub("k__", "", p)
+    if (startsWith(p, "p__")) tax_map$Phylum  <- gsub("p__", "", p)
+    if (startsWith(p, "c__")) tax_map$Class   <- gsub("c__", "", p)
+    if (startsWith(p, "o__")) tax_map$Order   <- gsub("o__", "", p)
+    if (startsWith(p, "f__")) tax_map$Family  <- gsub("f__", "", p)
+    if (startsWith(p, "g__")) tax_map$Genus   <- gsub("g__", "", p)
+    if (startsWith(p, "s__")) tax_map$Species <- gsub("s__", "", p)
+  }
+  as_tibble(tax_map)
+}
+
+taxonomy <- bind_rows(lapply(metaphlan_clean$clade, parse_taxonomy))
+taxonomy$clade <- metaphlan_clean$clade
+
+# ── Build abundance matrix ────────────────────────────────────────────────────
+# Keep species-level only for phyloseq
+species_data <- metaphlan_clean %>%
+  filter(grepl("s__", clade)) %>%
+  filter(!grepl("t__", clade))  # remove strain level if present
+
+species_tax <- taxonomy %>%
+  filter(grepl("s__", clade)) %>%
+  filter(!grepl("t__", clade))
+
+# Abundance matrix: rows = species, cols = samples
+abund_mat <- species_data %>%
+  select(all_of(sample_cols)) %>%
+  as.matrix()
+rownames(abund_mat) <- species_data$clade
+
+# Tax matrix
+tax_mat <- species_tax %>%
+  select(Kingdom, Phylum, Class, Order, Family, Genus, Species) %>%
+  as.matrix()
+rownames(tax_mat) <- species_data$clade
+
+# Sample metadata for phyloseq
+sample_meta <- metadata %>%
+  column_to_rownames("sequence_id")
+
+# ── Build phyloseq object (full, including blanks) ────────────────────────────
+# Align sample names between matrix and metadata
+shared_samples <- intersect(colnames(abund_mat), rownames(sample_meta))
+abund_mat_filt <- abund_mat[, shared_samples, drop = FALSE]
+sample_meta_filt <- sample_meta[shared_samples, , drop = FALSE]
+
+ps_full <- phyloseq(
+  otu_table(abund_mat_filt, taxa_are_rows = TRUE),
+  tax_table(tax_mat),
+  sample_data(sample_meta_filt)
+)
+
+# ── Check for samples in metadata missing from MetaPhlAn output ───────────────
+samples_missing_metaphlan <- setdiff(rownames(sample_meta), colnames(abund_mat))
+if (length(samples_missing_metaphlan) > 0) {
+  warning(paste(
+    "The following samples are in metadata but absent from metaphlan_merged.tsv",
+    "(likely failed QC or taxonomic profiling):",
+    paste(samples_missing_metaphlan, collapse = ", ")
+  ))
+}
+
+# Summary counts — based on what is actually in the MetaPhlAn output
+n_total   <- nsamples(ps_full)
+n_samples <- sum(sample_data(ps_full)$sample_group != "blank", na.rm = TRUE)
+n_blanks  <- sum(sample_data(ps_full)$sample_group == "blank", na.rm = TRUE)
+n_species <- nrow(species_data)
+```
+
+---
+
+# 1. Project Overview
+
+```{r project_summary}
+tibble(
+  Parameter = c(
+    "Sequencing type", "Host reference",
+    "Total samples", "Biological samples", "Blank samples",
+    "Species detected (pre-decontamination)",
+    "Decontamination ratio threshold",
+    "Decontamination span threshold",
+    "Report generated"
+  ),
+  Value = c(
+    toupper(cfg_type), cfg_host_ref,
+    n_total, n_samples, n_blanks,
+    n_species,
+    RATIO_THRESHOLD,
+    SPAN_THRESHOLD,
+    as.character(Sys.Date())
+  )
+) %>%
+  kable(col.names = c("Parameter", "Value"), align = "ll") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left")
+```
+
+---
+
+# 2. Unclassified Reads
+
+Proportion of reads that could not be classified by MetaPhlAn4 per sample.
+Samples exceeding `r scales::percent(UNCLASSIFIED_THRESHOLD)` unclassified reads are flagged.
+
+```{r unclassified_plot}
+if (nrow(unclassified_row) > 0) {
+  uncl_data <- unclassified_row %>%
+    select(all_of(sample_cols)) %>%
+    pivot_longer(everything(), names_to = "sequence_id", values_to = "pct_unclassified") %>%
+    mutate(pct_unclassified = as.numeric(pct_unclassified) / 100) %>%
+    left_join(metadata, by = "sequence_id") %>%
+    mutate(
+      display_name = ifelse(is.na(sample_name), sequence_id, sample_name),
+      sample_group = ifelse(is.na(sample_group), "unknown", sample_group),
+      flagged      = pct_unclassified > UNCLASSIFIED_THRESHOLD
+    )
+
+  plot_colours <- c(group_colours, "flagged" = "#E15759")
+
+  ggplot(uncl_data, aes(
+      x    = reorder(display_name, pct_unclassified),
+      y    = pct_unclassified,
+      fill = ifelse(flagged, "flagged", sample_group)
+    )) +
+    geom_col() +
+    geom_hline(yintercept = UNCLASSIFIED_THRESHOLD,
+               linetype = "dashed", colour = "grey40") +
+    scale_fill_manual(values = plot_colours, name = NULL) +
+    scale_y_continuous(labels = scales::percent) +
+    coord_flip() +
+    labs(x = NULL, y = "% Unclassified", title = "Unclassified reads per sample") +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "bottom")
+} else {
+  cat("No UNCLASSIFIED row found in merged MetaPhlAn table.\n")
+}
+```
+
+```{r unclassified_flags, results='asis'}
+if (nrow(unclassified_row) > 0) {
+  flagged <- uncl_data %>%
+    filter(flagged) %>%
+    select(display_name, sample_group, pct_unclassified) %>%
+    mutate(pct_unclassified = scales::percent(pct_unclassified, accuracy = 0.1))
+
+  if (nrow(flagged) > 0) {
+    cat(paste0("**⚠ ", nrow(flagged),
+               " sample(s) exceed the unclassified threshold (",
+               scales::percent(UNCLASSIFIED_THRESHOLD), "):**\n\n"))
+    flagged %>%
+      kable(col.names = c("Sample", "Group", "% Unclassified"), align = "llr") %>%
+      kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                    full_width = FALSE, position = "left") %>%
+      row_spec(seq_len(nrow(flagged)), background = "#f8d7da") %>%
+      print()
+  } else {
+    cat(paste0("✓ All samples are below the unclassified threshold (",
+               scales::percent(UNCLASSIFIED_THRESHOLD), ").\n"))
+  }
+}
+```
+
+---
+
+# 3. Decontamination
+
+Contaminants are identified using the MicrobIEM ratio and span filters applied at
+species level using blank samples as negative controls.
+
+- **Ratio filter**: a taxon is flagged if its mean relative abundance in blanks divided
+  by its mean relative abundance in biological samples exceeds `r RATIO_THRESHOLD`.
+- **Span filter**: a taxon is flagged if it is present in ≥ `r scales::percent(SPAN_THRESHOLD)`
+  of blank samples.
+
+Taxa flagged by either filter are removed. The cleaned phyloseq object is saved to disk.
+
+```{r decontamination}
+if (n_blanks == 0) {
+  cat("No blank samples found in metadata. Decontamination step skipped.\n")
+  ps_clean <- subset_samples(ps_full, sample_group != "blank")
+} else {
+  # Split phyloseq into blanks and samples
+  ps_blanks  <- subset_samples(ps_full, sample_group == "blank")
+  ps_samples <- subset_samples(ps_full, sample_group != "blank")
+
+  abund_blank   <- as.data.frame(otu_table(ps_blanks))
+  abund_samples <- as.data.frame(otu_table(ps_samples))
+
+  # Convert to relative abundance if not already
+  rel_blank   <- sweep(abund_blank,   2, colSums(abund_blank),   "/")
+  rel_samples <- sweep(abund_samples, 2, colSums(abund_samples), "/")
+
+  # Replace NaN from zero-sum columns
+  rel_blank[is.nan(as.matrix(rel_blank))]     <- 0
+  rel_samples[is.nan(as.matrix(rel_samples))] <- 0
+
+  mean_blank   <- rowMeans(rel_blank,   na.rm = TRUE)
+  mean_samples <- rowMeans(rel_samples, na.rm = TRUE)
+
+  # Ratio filter
+  ratio <- ifelse(mean_samples > 0, mean_blank / mean_samples, Inf)
+  ratio_flag <- ratio > RATIO_THRESHOLD
+
+  # Span filter: proportion of blanks where taxon is present
+  span <- rowSums(abund_blank > 0) / ncol(abund_blank)
+  span_flag <- span >= SPAN_THRESHOLD
+
+  # Combined flag
+  contaminant_flag <- ratio_flag | span_flag
+
+  n_contaminants   <- sum(contaminant_flag)
+  contaminant_taxa <- names(contaminant_flag[contaminant_flag])
+
+  # Remove contaminants and blanks from phyloseq
+  ps_clean <- subset_samples(ps_full, sample_group != "blank")
+  if (n_contaminants > 0) {
+    taxa_to_keep <- taxa_names(ps_clean)[!taxa_names(ps_clean) %in% contaminant_taxa]
+    ps_clean     <- prune_taxa(taxa_to_keep, ps_clean)
+  }
+
+  # Remove taxa with zero abundance after blank removal
+  ps_clean <- prune_taxa(taxa_sums(ps_clean) > 0, ps_clean)
+}
+
+n_taxa_clean   <- ntaxa(ps_clean)
+n_taxa_removed <- n_species - n_taxa_clean
+
+# ── Sample filtering ──────────────────────────────────────────────────────────
+# 1. Remove samples exceeding the unclassified threshold
+samples_high_uncl <- character(0)
+if (nrow(unclassified_row) > 0) {
+  samples_high_uncl <- uncl_data %>%
+    filter(flagged) %>%
+    pull(sequence_id)
+  if (length(samples_high_uncl) > 0) {
+    ps_clean <- subset_samples(
+      ps_clean,
+      !rownames(sample_data(ps_clean)) %in% samples_high_uncl
+    )
+  }
+}
+
+# 2. Remove samples where all taxa were removed by decontamination
+sample_sums_clean  <- sample_sums(ps_clean)
+samples_empty      <- names(sample_sums_clean[sample_sums_clean == 0])
+if (length(samples_empty) > 0) {
+  ps_clean <- subset_samples(ps_clean, sample_sums(ps_clean) > 0)
+}
+
+n_samples_removed_uncl  <- length(samples_high_uncl)
+n_samples_removed_empty <- length(samples_empty)
+n_samples_final         <- nsamples(ps_clean)
+
+# ── Rescale to compositional (TSS) ───────────────────────────────────────────
+ps_clean <- transform_sample_counts(ps_clean, function(x) x / sum(x) * 100)
+
+# Save final cleaned and rescaled phyloseq object
+saveRDS(ps_clean, file = "ps_clean.rds")
+```
+
+```{r decontamination_summary, results='asis'}
+if (n_blanks > 0) {
+  tibble(
+    Metric = c(
+      "Species before decontamination",
+      "Contaminants removed (ratio filter)",
+      "Contaminants removed (span filter)",
+      "Total taxa removed",
+      "Species after decontamination"
+    ),
+    Value = c(
+      n_species,
+      sum(ratio_flag),
+      sum(span_flag),
+      n_taxa_removed,
+      n_taxa_clean
+    )
+  ) %>%
+    kable(col.names = c("Metric", "Value"), align = "lr") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE, position = "left") %>%
+    print()
+
+  if (n_contaminants > 0) {
+    cat("\n**Removed taxa:**\n\n")
+    tibble(
+      Taxon  = contaminant_taxa,
+      Ratio  = round(ratio[contaminant_taxa], 4),
+      Span   = round(span[contaminant_taxa], 2),
+      Reason = case_when(
+        ratio_flag[contaminant_taxa] & span_flag[contaminant_taxa] ~ "ratio + span",
+        ratio_flag[contaminant_taxa] ~ "ratio",
+        TRUE ~ "span"
+      )
+    ) %>%
+      arrange(desc(Ratio)) %>%
+      kable(col.names = c("Taxon", "Ratio (blank/sample)",
+                          "Span (prop. blanks)", "Filter"),
+            align = "lrrl") %>%
+      kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                    full_width = TRUE) %>%
+      row_spec(seq_len(n_contaminants), background = "#fff3cd") %>%
+      print()
+  } else {
+    cat("✓ No contaminants identified with the current thresholds.\n")
+  }
+}
+```
+
+## 3.4 Sample Filtering and Compositional Rescaling
+
+Samples are excluded from downstream analysis if they exceed the unclassified
+threshold (`r scales::percent(UNCLASSIFIED_THRESHOLD)`) or if all their taxa were
+removed during decontamination. Remaining samples are then rescaled to
+compositional relative abundances (TSS, summing to 100%) before downstream analyses.
+
+```{r sample_filtering_summary, results='asis'}
+tibble(
+  Metric = c(
+    "Samples before filtering",
+    "Removed (unclassified > threshold)",
+    "Removed (all taxa depleted by decontamination)",
+    "Samples retained for downstream analysis",
+    "Normalisation"
+  ),
+  Value = c(
+    n_samples,
+    n_samples_removed_uncl,
+    n_samples_removed_empty,
+    n_samples_final,
+    "TSS (relative abundance, sum to 100%)"
+  )
+) %>%
+  kable(col.names = c("Metric", "Value"), align = "lr") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left") %>%
+  print()
+
+if (n_samples_removed_uncl > 0) {
+  cat("\n**⚠ Samples removed (high unclassified proportion):**\n\n")
+  tibble(sequence_id = samples_high_uncl) %>%
+    left_join(metadata, by = "sequence_id") %>%
+    select(sequence_id, sample_name, sample_group) %>%
+    kable(col.names = c("Sequence ID", "Sample Name", "Group"), align = "lll") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE, position = "left") %>%
+    row_spec(seq_len(n_samples_removed_uncl), background = "#f8d7da") %>%
+    print()
+}
+
+if (n_samples_removed_empty > 0) {
+  cat("\n**⚠ Samples removed (all taxa depleted after decontamination):**\n\n")
+  tibble(sequence_id = samples_empty) %>%
+    left_join(metadata, by = "sequence_id") %>%
+    select(sequence_id, sample_name, sample_group) %>%
+    kable(col.names = c("Sequence ID", "Sample Name", "Group"), align = "lll") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE, position = "left") %>%
+    row_spec(seq_len(n_samples_removed_empty), background = "#f8d7da") %>%
+    print()
+}
+
+if (n_samples_removed_uncl == 0 && n_samples_removed_empty == 0) {
+  cat("✓ No samples removed. All samples retained for downstream analysis.\n")
+}
+
+cat(paste0("\nFinal cleaned and rescaled phyloseq object saved to: ",
+           "`02_taxonomic_profiling/ps_clean.rds`\n"))
+```
+
+---
+
+# 4. Alpha Diversity
+
+Observed species richness, Shannon entropy, and Pielou's evenness per sample,
+computed on the decontaminated species-level profiles.
+
+```{r alpha_diversity}
+# Compute alpha diversity metrics
+alpha_div <- microbiome::alpha(ps_clean, index = c("Observed", "Shannon", "Pielou")) %>%
+  rownames_to_column("sequence_id") %>%
+  left_join(metadata, by = "sequence_id") %>%
+  mutate(
+    display_name = ifelse(is.na(sample_name), sequence_id, sample_name),
+    sample_group = ifelse(is.na(sample_group), "unknown", sample_group)
+  ) %>%
+  rename("Observed"="observed", "Shannon"="diversity_shannon", "Pielou"="evenness_pielou")
+
+# Reshape for faceted plot
+alpha_long <- alpha_div %>%
+  select(display_name, sample_group, Observed, Shannon, Pielou) %>%
+  pivot_longer(
+    cols      = c(Observed, Shannon, Pielou),
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(metric = factor(metric, levels = c("Observed", "Shannon", "Pielou")))
+
+metric_labels <- c(
+  "Observed" = "Observed Richness",
+  "Shannon"  = "Shannon Entropy",
+  "Pielou"   = "Pielou Evenness"
+)
+
+ggplot(alpha_long, aes(x = sample_group, y = value, fill = sample_group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.15, size = 2, alpha = 0.8, aes(colour = sample_group)) +
+  scale_fill_manual(values  = group_colours, name = NULL) +
+  scale_colour_manual(values = group_colours, name = NULL) +
+  facet_wrap(~metric, scales = "free_y", labeller = labeller(metric = metric_labels)) +
+  labs(x = NULL, y = NULL, title = "Alpha Diversity by Sample Group") +
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position = "none",
+    axis.text.x     = element_text(angle = 30, hjust = 1),
+    strip.background = element_rect(fill = "#f0f0f0")
+  )
+```
+
+```{r alpha_table}
+alpha_div %>%
+  select(display_name, sample_group, Observed, Shannon, Pielou) %>%
+  mutate(
+    Shannon = round(Shannon, 3),
+    Pielou  = round(Pielou,  3)
+  ) %>%
+  arrange(sample_group, display_name) %>%
+  kable(
+    col.names = c("Sample", "Group", "Observed Richness",
+                  "Shannon", "Pielou Evenness"),
+    align = "llrrr"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE)
+```
+
+---
+
+# 5. Beta Diversity
+
+Principal Coordinates Analysis (PCoA) based on Bray-Curtis dissimilarity computed
+on species-level relative abundances after decontamination.
+
+```{r beta_diversity}
+# Compute Bray-Curtis distance
+abund_clean <- as.data.frame(t(otu_table(ps_clean)))  # samples as rows
+bc_dist     <- vegdist(abund_clean, method = "bray")
+
+# PCoA
+pcoa_res  <- cmdscale(bc_dist, eig = TRUE, k = 2)
+pct_var   <- round(pcoa_res$eig / sum(pcoa_res$eig[pcoa_res$eig > 0]) * 100, 1)
+
+pcoa_df <- as.data.frame(pcoa_res$points) %>%
+  setNames(c("PC1", "PC2")) %>%
+  rownames_to_column("sequence_id") %>%
+  left_join(metadata, by = "sequence_id") %>%
+  mutate(
+    display_name = ifelse(is.na(sample_name), sequence_id, sample_name),
+    sample_group = ifelse(is.na(sample_group), "unknown", sample_group)
+  )
+
+ggplot(pcoa_df, aes(x = PC1, y = PC2,
+                    colour = sample_group, label = display_name)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(aes(group = sample_group), type = "t", level = 0.95,
+               linetype = "dashed", linewidth = 0.5) +
+  scale_colour_manual(values = group_colours, name = "Group") +
+  ggrepel::geom_text_repel(size = 3, max.overlaps = 10, show.legend = FALSE) +
+  labs(
+    x = paste0("PC1 (", pct_var[1], "%)"),
+    y = paste0("PC2 (", pct_var[2], "%)"),
+    title = "PCoA — Bray-Curtis Dissimilarity (species level)"
+  ) +
+  theme_bw(base_size = 11)
+```
+
+```{r permanova, results='asis'}
+# PERMANOVA test
+meta_clean <- as(sample_data(ps_clean), "data.frame")
+if (length(unique(meta_clean$sample_group)) > 1) {
+  perm <- adonis2(bc_dist ~ sample_group, data = meta_clean, permutations = 999)
+  cat("**PERMANOVA result (Bray-Curtis, 999 permutations):**\n\n")
+  perm %>%
+    as.data.frame() %>%
+    rownames_to_column("Term") %>%
+    mutate(across(where(is.numeric), ~round(.x, 4))) %>%
+    kable(align = "lrrrrr") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE, position = "left") %>%
+    print()
+} else {
+  cat("Only one sample group detected — PERMANOVA not computed.\n")
+}
+```
+
+---
+
+# 6. Taxonomic Composition
+
+Top `r TOP_N_TAXA` taxa by mean relative abundance across biological samples,
+after decontamination. Blanks are excluded.
+
+```{r tax_barplot_function, include=FALSE}
+make_tax_barplot <- function(ps_obj, level, top_n, group_cols) {
+  # Aggregate at requested taxonomic level
+  ps_level <- tax_glom(ps_obj, taxrank = level, NArm = FALSE)
+
+  # Convert to relative abundance
+  ps_rel <- transform_sample_counts(ps_level, function(x) x / sum(x) * 100)
+
+  # Get top N taxa by mean abundance
+  mean_abund  <- rowMeans(otu_table(ps_rel))
+  top_taxa    <- names(sort(mean_abund, decreasing = TRUE))[seq_len(min(top_n, length(mean_abund)))]
+
+  # Melt to long format
+  abund_long <- as.data.frame(t(otu_table(ps_rel))) %>%
+    rownames_to_column("sequence_id") %>%
+    pivot_longer(-sequence_id, names_to = "taxon_id", values_to = "abundance") %>%
+    left_join(
+      as.data.frame(tax_table(ps_rel)) %>% rownames_to_column("taxon_id"),
+      by = "taxon_id"
+    ) %>%
+    left_join(
+      as(sample_data(ps_rel), "data.frame") %>% rownames_to_column("sequence_id"),
+      by = "sequence_id"
+    ) %>%
+    mutate(
+      taxon_label  = ifelse(is.na(.data[[level]]) | .data[[level]] == "",
+                            "Unassigned", .data[[level]]),
+      display_name = ifelse(is.na(sample_name), sequence_id, sample_name),
+      in_top       = taxon_id %in% top_taxa,
+      taxon_plot   = ifelse(in_top, taxon_label, "Other")
+    )
+
+  # Get ordered list of top taxa for colour assignment
+  top_labels <- abund_long %>%
+    filter(in_top) %>%
+    group_by(taxon_plot) %>%
+    summarise(mean_abund = mean(abundance), .groups = "drop") %>%
+    arrange(desc(mean_abund)) %>%
+    pull(taxon_plot)
+
+  all_labels   <- c(top_labels, "Other")
+  n_top        <- length(top_labels)
+  tax_colours  <- setNames(
+    c(colorRampPalette(c("#4E79A7","#F28E2B","#59A14F","#E15759",
+                         "#76B7B2","#EDC948","#B07AA1","#FF9DA7",
+                         "#9C755F","#BAB0AC"))(n_top), "#DDDDDD"),
+    all_labels
+  )
+
+  # Summarise by sample
+  plot_data <- abund_long %>%
+    group_by(display_name, sample_group, taxon_plot) %>%
+    summarise(abundance = sum(abundance), .groups = "drop") %>%
+    mutate(taxon_plot = factor(taxon_plot, levels = rev(all_labels)))
+
+  ggplot(plot_data, aes(x = display_name, y = abundance, fill = taxon_plot)) +
+    geom_col(position = "stack") +
+    scale_fill_manual(values = tax_colours, name = level) +
+    scale_y_continuous(labels = function(x) paste0(x, "%")) +
+    labs(x = NULL, y = "Relative Abundance", title = paste0("Top ", top_n, " ", level)) +
+    theme_bw(base_size = 10) +
+    theme(
+      axis.text.x    = element_text(angle = 45, hjust = 1),
+      legend.position = "right",
+      legend.text     = element_text(size = 8)
+    ) +
+    guides(fill = guide_legend(reverse = TRUE, ncol = 1))
+}
+```
+
+## 6.1 Family Level
+
+```{r barplot_family, fig.height=6}
+make_tax_barplot(ps_clean, level = "Family", top_n = TOP_N_TAXA,
+                 group_cols = group_colours)
+```
+
+## 6.2 Genus Level
+
+```{r barplot_genus, fig.height=6}
+make_tax_barplot(ps_clean, level = "Genus", top_n = TOP_N_TAXA,
+                 group_cols = group_colours)
+```
+
+## 6.3 Species Level
+
+```{r barplot_species, fig.height=6}
+make_tax_barplot(ps_clean, level = "Species", top_n = TOP_N_TAXA,
+                 group_cols = group_colours)
+```

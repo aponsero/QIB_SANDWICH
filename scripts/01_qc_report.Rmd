@@ -1,0 +1,577 @@
+---
+title: "QC Report — Metagenomics Pipeline"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE
+)
+
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(patchwork)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# USER-ADJUSTABLE PARAMETERS
+# ══════════════════════════════════════════════════════════════════════════════
+# Samples with fewer reads than this after trimming will be flagged
+MIN_READS <- 10000
+```
+
+```{r load_config, include=FALSE}
+config_lines <- readLines("../config.sh")
+
+extract_config <- function(lines, key) {
+  line <- lines[grep(paste0("^", key, "="), lines)]
+  if (length(line) == 0) return(NA)
+  value <- gsub(paste0(key, "=|\""), "", line[1])
+  value <- gsub("#.*$", "", value)
+  trimws(value)
+}
+
+cfg_type          <- extract_config(config_lines, "TYPE")
+cfg_remove_human  <- extract_config(config_lines, "REMOVE_HUMAN")
+cfg_food_host_ref <- extract_config(config_lines, "FOOD_HOST_REF")
+cfg_out_dir       <- extract_config(config_lines, "OUT_DIR")
+```
+
+```{r load_data, include=FALSE}
+# ── Metadata ──────────────────────────────────────────────────────────────────
+metadata_path <- "../metadata.tsv"
+if (!file.exists(metadata_path)) {
+  stop("metadata.tsv not found. Please add it to 04_aggregated/ before rendering.")
+}
+metadata <- read_tsv(metadata_path, col_types = cols(.default = "c")) %>%
+  rename_with(tolower)
+
+required_cols <- c("sequence_id", "sample_name", "sample_group")
+missing_cols  <- setdiff(required_cols, colnames(metadata))
+if (length(missing_cols) > 0) {
+  stop(paste("metadata.tsv is missing columns:", paste(missing_cols, collapse = ", ")))
+}
+
+# ── Build colour palette from sample_group ────────────────────────────────────
+groups        <- unique(metadata$sample_group)
+non_blank     <- groups[groups != "blank"]
+base_colours  <- c("#4E79A7", "#59A14F", "#F28E2B", "#B07AA1",
+                   "#76B7B2", "#EDC948", "#FF9DA7", "#9C755F")
+group_colours <- setNames(base_colours[seq_along(non_blank)], non_blank)
+group_colours["blank"] <- "#AAAAAA"
+
+# ── Hostile summary ───────────────────────────────────────────────────────────
+hostile_path <- "hostile_summary.csv"
+if (!file.exists(hostile_path)) {
+  stop("hostile_summary.csv not found. Has 01b_qc_merge completed successfully?")
+}
+hostile <- read_csv(hostile_path, col_types = cols(.default = "c")) %>%
+  mutate(
+    reads_in                       = as.numeric(reads_in),
+    reads_after_human              = as.numeric(reads_after_human),
+    reads_out                      = as.numeric(reads_out),
+    reads_removed_human            = as.numeric(reads_removed_human),
+    reads_removed_proportion_human = as.numeric(reads_removed_proportion_human),
+    reads_removed_food             = as.numeric(reads_removed_food),
+    reads_removed_proportion_food  = as.numeric(reads_removed_proportion_food),
+    food_host                      = as.character(food_host)
+  )
+
+# Derive food host summary variables used by section 2.2
+any_food_removed <- any(hostile$food_host != "none" & !is.na(hostile$food_host))
+unique_hosts     <- hostile %>%
+  filter(food_host != "none", !is.na(food_host)) %>%
+  pull(food_host) %>%
+  unique() %>%
+  sort()
+unique_hosts_label <- paste(unique_hosts, collapse = ", ")
+
+# ── Join metadata and hostile ─────────────────────────────────────────────────
+data <- hostile %>%
+  left_join(metadata, by = c("sample_name" = "sequence_id"))
+
+unmatched <- data %>% filter(is.na(sample_group))
+if (nrow(unmatched) > 0) {
+  warning(paste(
+    "The following samples are in hostile_summary.csv but not in metadata.tsv:",
+    paste(unmatched$sample_name, collapse = ", ")
+  ))
+}
+
+# Summary counts
+n_total   <- nrow(metadata)
+n_samples <- sum(metadata$sample_group != "blank", na.rm = TRUE)
+n_blanks  <- sum(metadata$sample_group == "blank", na.rm = TRUE)
+
+# ── MultiQC general stats ─────────────────────────────────────────────────────
+multiqc_path <- "multiqc/multiqc_report_data/multiqc_general_stats.txt"
+if (!file.exists(multiqc_path)) {
+  stop("multiqc_general_stats.txt not found. Has 01b_qc_merge completed successfully?")
+}
+multiqc_raw <- read_tsv(multiqc_path, col_types = cols(.default = "c")) %>%
+  rename(
+    sample_raw      = Sample,
+    pct_duplicates  = `FastQC_mqc-generalstats-fastqc-percent_duplicates`,
+    pct_gc          = `FastQC_mqc-generalstats-fastqc-percent_gc`,
+    avg_length      = `FastQC_mqc-generalstats-fastqc-avg_sequence_length`,
+    median_length   = `FastQC_mqc-generalstats-fastqc-median_sequence_length`,
+    pct_fails       = `FastQC_mqc-generalstats-fastqc-percent_fails`,
+    total_sequences = `FastQC_mqc-generalstats-fastqc-total_sequences`
+  ) %>%
+  mutate(across(c(pct_duplicates, pct_gc, avg_length,
+                  median_length, pct_fails, total_sequences), as.numeric))
+
+# Keep R1 only and strip TrimGalore suffix to recover sequence_id
+multiqc <- multiqc_raw %>%
+  filter(grepl("_R1_", sample_raw)) %>%
+  mutate(sequence_id = gsub("_hostremoved_R1_val_1$", "", sample_raw)) %>%
+  left_join(metadata, by = "sequence_id")
+
+# ── MultiQC FastQC per-module stats ───────────────────────────────────────────
+fastqc_path <- "multiqc/multiqc_report_data/multiqc_fastqc.txt"
+if (!file.exists(fastqc_path)) {
+  stop("multiqc_fastqc.txt not found. Has 01b_qc_merge completed successfully?")
+}
+fastqc_modules <- read_tsv(fastqc_path, col_types = cols(.default = "c")) %>%
+  filter(grepl("_R1_", Sample)) %>%
+  mutate(sequence_id = gsub("_hostremoved_R1_val_1$", "", Sample)) %>%
+  left_join(metadata, by = "sequence_id") %>%
+  mutate(display_name = ifelse(is.na(sample_name), sequence_id, sample_name))
+
+module_cols <- c(
+  "basic_statistics", "per_base_sequence_quality", "per_sequence_quality_scores",
+  "per_base_sequence_content", "per_sequence_gc_content", "per_base_n_content",
+  "sequence_length_distribution", "sequence_duplication_levels",
+  "overrepresented_sequences", "adapter_content"
+)
+```
+
+---
+
+# 1. Project Overview
+
+```{r project_summary_table}
+tibble(
+  Parameter = c(
+    "Sequencing type",
+    "Human host removal",
+    "Food host reference",
+    "Total samples",
+    "Biological samples",
+    "Blank samples",
+    "Report generated"
+  ),
+  Value = c(
+    toupper(cfg_type),
+    cfg_remove_human,
+    ifelse(any_food_removed, unique_hosts_label, "not applied"),
+    n_total,
+    n_samples,
+    n_blanks,
+    as.character(Sys.Date())
+  )
+) %>%
+  kable(col.names = c("Parameter", "Value"), align = "ll") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    position          = "left"
+  )
+```
+
+## Sample List
+
+```{r sample_list_table}
+table_data <- data %>%
+  select(
+    sequence_id  = sample_name,
+    display_name = sample_name.y,
+    group        = sample_group,
+    reads_in,
+    reads_out
+  ) %>%
+  mutate(
+    reads_in  = formatC(reads_in,  format = "d", big.mark = ","),
+    reads_out = formatC(reads_out, format = "d", big.mark = ","),
+    group     = factor(group)
+  ) %>%
+  arrange(group, sequence_id)
+
+blank_rows <- which(table_data$group == "blank")
+
+table_data %>%
+  kable(
+    col.names = c("Sequence ID", "Sample Name", "Group",
+                  "Raw Reads", "Reads After Host Removal"),
+    align = "lllrr"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = TRUE
+  ) %>%
+  row_spec(blank_rows, background = "#f0f0f0")
+```
+
+---
+
+# 2. Host Removal
+
+## 2.1 Human Host Removal
+
+```{r human_removal, results='asis'}
+if (cfg_remove_human != "true") {
+  cat("Human host removal was not applied in this run (`REMOVE_HUMAN=false`).\n")
+} else {
+  cat("Proportion of reads removed by Hostile (human reference) per sample.
+Samples where the removal proportion is an outlier (beyond 2 standard deviations
+from the mean of biological samples) are flagged in red.\n")
+}
+```
+
+```{r human_removal_plot, fig.width=10, fig.height=5, eval=(cfg_remove_human == "true")}
+human_data <- data %>%
+  mutate(
+    pct_removed  = reads_removed_proportion_human * 100,
+    display_name = ifelse(is.na(sample_name.y), sample_name, sample_name.y),
+    sample_group = ifelse(is.na(sample_group), "unknown", sample_group)
+  )
+
+# Outlier detection on biological samples only
+bio_mean <- mean(human_data$pct_removed[human_data$sample_group != "blank"],
+                 na.rm = TRUE)
+bio_sd   <- sd(human_data$pct_removed[human_data$sample_group != "blank"],
+               na.rm = TRUE)
+
+human_data <- human_data %>%
+  mutate(outlier = abs(pct_removed - bio_mean) > 2 * bio_sd &
+                   sample_group != "blank")
+
+plot_colours <- c(group_colours, "outlier" = "#E15759")
+
+ggplot(human_data, aes(
+    x    = reorder(display_name, pct_removed),
+    y    = pct_removed,
+    fill = ifelse(outlier, "outlier", sample_group)
+  )) +
+  geom_col() +
+  geom_hline(yintercept = bio_mean, linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values = plot_colours, name = NULL) +
+  coord_flip() +
+  labs(
+    x     = NULL,
+    y     = "% Reads Removed",
+    title = "Human host reads removed (human-t2t-hla reference)"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+```{r human_removal_flags, results='asis', eval=(cfg_remove_human == "true")}
+flags <- human_data %>%
+  filter(outlier) %>%
+  select(display_name, pct_removed) %>%
+  mutate(pct_removed = round(pct_removed, 2))
+
+if (nrow(flags) > 0) {
+  cat("**⚠ Flagged samples (outlier human removal rate):**\n\n")
+  flags %>%
+    kable(col.names = c("Sample", "% Human Reads Removed"), align = "lr") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE, position = "left") %>%
+    print()
+} else {
+  cat("✓ No outlier samples detected for human read removal rate.\n")
+}
+```
+
+## 2.2 Food Host Removal
+
+```{r food_removal, results='asis'}
+if (!any_food_removed) {
+  cat("Food host removal was not applied in this run.\n")
+} else {
+  cat(paste0(
+    "Proportion of reads removed by Hostile (food host reference) per sample, ",
+    "after human removal. Food hosts removed: **", unique_hosts_label, "**. ",
+    "Samples where the removal proportion is an outlier (beyond 2 standard deviations ",
+    "from the mean within each food host group) are flagged in red.\n"
+  ))
+}
+```
+
+```{r food_removal_plot, fig.width=10, fig.height=5, eval=any_food_removed}
+food_data <- data %>%
+  mutate(
+    pct_removed  = reads_removed_proportion_food * 100,
+    display_name = ifelse(is.na(sample_name.y), sample_name, sample_name.y),
+    sample_group = ifelse(is.na(sample_group), "unknown", sample_group),
+    food_host    = ifelse(is.na(food_host) | food_host == "none",
+                          "not applied", food_host)
+  )
+
+# Outlier detection per food host group, biological samples only
+food_data <- food_data %>%
+  group_by(food_host) %>%
+  mutate(
+    grp_mean = mean(pct_removed[sample_group != "blank"], na.rm = TRUE),
+    grp_sd   = sd(pct_removed[sample_group != "blank"],   na.rm = TRUE),
+    outlier  = abs(pct_removed - grp_mean) > 2 * grp_sd &
+               sample_group != "blank" &
+               food_host != "not applied"
+  ) %>%
+  ungroup()
+
+plot_colours <- c(group_colours, "outlier" = "#E15759")
+
+ggplot(food_data, aes(
+    x    = reorder(display_name, pct_removed),
+    y    = pct_removed,
+    fill = ifelse(outlier, "outlier", sample_group)
+  )) +
+  geom_col() +
+  scale_fill_manual(values = plot_colours, name = NULL) +
+  facet_wrap(~ food_host, scales = "free_y", ncol = 1) +
+  coord_flip() +
+  labs(
+    x     = NULL,
+    y     = "% Reads Removed",
+    title = paste0("Food host reads removed (", unique_hosts_label, ")")
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position  = "bottom",
+    strip.background = element_rect(fill = "#f0f0f0")
+  )
+```
+
+```{r food_removal_flags, results='asis', eval=any_food_removed}
+flags_food <- food_data %>%
+  filter(outlier) %>%
+  select(display_name, food_host, pct_removed) %>%
+  mutate(pct_removed = round(pct_removed, 2)) %>%
+  arrange(food_host, desc(pct_removed))
+
+if (nrow(flags_food) > 0) {
+  cat("**⚠ Flagged samples (outlier food host removal rate):**\n\n")
+  flags_food %>%
+    kable(col.names = c("Sample", "Food Host", "% Reads Removed"), align = "llr") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE, position = "left") %>%
+    print()
+} else {
+  cat(paste0("✓ No outlier samples detected across food host groups (",
+             unique_hosts_label, ").\n"))
+}
+```
+
+---
+
+# 3. Read Quality After Trimming
+
+## 3.1 Read Counts After Trimming
+
+Total reads retained per sample after all host removal steps and quality trimming
+(R1 only). Samples below the minimum read threshold
+(`r format(MIN_READS, big.mark=",")` reads) are flagged in red.
+
+```{r read_counts_plot, fig.width=10, fig.height=5}
+reads_data <- multiqc %>%
+  mutate(
+    display_name = ifelse(is.na(sample_name), sequence_id, sample_name),
+    sample_group = ifelse(is.na(sample_group), "unknown", sample_group),
+    low_reads    = total_sequences < MIN_READS
+  )
+
+plot_colours_reads <- c(group_colours, "low_reads" = "#E15759")
+
+ggplot(reads_data, aes(
+    x    = reorder(display_name, total_sequences),
+    y    = total_sequences / 1e6,
+    fill = ifelse(low_reads, "low_reads", sample_group)
+  )) +
+  geom_col() +
+  geom_hline(yintercept = MIN_READS / 1e6, linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values = plot_colours_reads, name = NULL) +
+  coord_flip() +
+  labs(
+    x     = NULL,
+    y     = "Total Reads (millions)",
+    title = "Reads retained after host removal and trimming (R1)"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+## 3.2 GC Content and Duplication Rate
+
+```{r gc_dup_plot, fig.width=12, fig.height=5}
+gc_dup_data <- multiqc %>%
+  mutate(
+    display_name = ifelse(is.na(sample_name), sequence_id, sample_name),
+    sample_group = ifelse(is.na(sample_group), "unknown", sample_group)
+  )
+
+p1 <- ggplot(gc_dup_data, aes(
+    x    = reorder(display_name, pct_gc),
+    y    = pct_gc,
+    fill = sample_group
+  )) +
+  geom_col() +
+  geom_hline(yintercept = 50, linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values = group_colours, name = NULL) +
+  coord_flip() +
+  labs(x = NULL, y = "% GC", title = "GC Content") +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "none")
+
+p2 <- ggplot(gc_dup_data, aes(
+    x    = reorder(display_name, pct_duplicates),
+    y    = pct_duplicates,
+    fill = sample_group
+  )) +
+  geom_col() +
+  scale_fill_manual(values = group_colours, name = NULL) +
+  coord_flip() +
+  labs(x = NULL, y = "% Duplicates", title = "Duplication Rate") +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "bottom")
+
+p1 + p2
+```
+
+---
+
+# 4. Quality Flags
+
+## 4.1 Samples Below Minimum Read Threshold
+
+```{r low_reads_flag, results='asis'}
+low_reads <- reads_data %>%
+  filter(low_reads) %>%
+  select(display_name, sample_group, total_sequences) %>%
+  mutate(total_sequences = formatC(total_sequences, format = "d", big.mark = ","))
+
+if (nrow(low_reads) > 0) {
+  cat(paste0("**⚠ ", nrow(low_reads), " sample(s) below minimum read threshold (",
+             format(MIN_READS, big.mark = ","), " reads):**\n\n"))
+  low_reads %>%
+    kable(col.names = c("Sample", "Group", "Total Reads"), align = "llr") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE, position = "left") %>%
+    row_spec(seq_len(nrow(low_reads)), background = "#f8d7da") %>%
+    print()
+} else {
+  cat(paste0("✓ All samples are above the minimum read threshold (",
+             format(MIN_READS, big.mark = ","), " reads).\n"))
+}
+```
+
+## 4.2 FastQC Module Status
+
+Pass/warn/fail status per FastQC module per sample (R1 only).
+Failing modules are highlighted in red, warnings in orange.
+
+```{r fastqc_module_heatmap, fig.width=12, fig.height=6}
+heatmap_data <- fastqc_modules %>%
+  select(display_name, all_of(module_cols)) %>%
+  pivot_longer(
+    cols      = all_of(module_cols),
+    names_to  = "module",
+    values_to = "status"
+  ) %>%
+  mutate(
+    status = factor(status, levels = c("pass", "warn", "fail")),
+    module = gsub("_", " ", module)
+  )
+
+status_colours <- c(
+  "pass" = "#59A14F",
+  "warn" = "#F28E2B",
+  "fail" = "#E15759"
+)
+
+ggplot(heatmap_data, aes(x = module, y = display_name, fill = status)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  scale_fill_manual(values = status_colours, name = "Status", drop = FALSE) +
+  labs(x = NULL, y = NULL, title = "FastQC Module Status (R1)") +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+```
+
+```{r fastqc_fail_summary, results='asis'}
+fail_summary <- heatmap_data %>%
+  filter(status == "fail") %>%
+  group_by(module) %>%
+  summarise(n_failing = n(), samples = paste(display_name, collapse = ", "),
+            .groups = "drop") %>%
+  arrange(desc(n_failing))
+
+if (nrow(fail_summary) > 0) {
+  cat("**⚠ Modules with failing samples:**\n\n")
+  fail_summary %>%
+    kable(col.names = c("Module", "# Failing Samples", "Samples"),
+          align = "lrl") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = TRUE) %>%
+    row_spec(seq_len(nrow(fail_summary)), background = "#f8d7da") %>%
+    print()
+} else {
+  cat("✓ No samples have failing FastQC modules.\n")
+}
+```
+
+## 4.3 Blank Sample Comparison
+
+Read counts and GC content of blank samples compared to biological samples,
+to help assess contamination levels.
+
+```{r blank_comparison, results='asis'}
+if (n_blanks == 0) {
+  cat("No blank samples found in metadata.\n")
+} else {
+  blank_comparison <- multiqc %>%
+    mutate(
+      display_name = ifelse(is.na(sample_name), sequence_id, sample_name),
+      sample_group = ifelse(is.na(sample_group), "unknown", sample_group),
+      type         = ifelse(sample_group == "blank", "Blank", "Biological sample")
+    ) %>%
+    group_by(type) %>%
+    summarise(
+      n            = n(),
+      mean_reads   = round(mean(total_sequences, na.rm = TRUE)),
+      median_reads = round(median(total_sequences, na.rm = TRUE)),
+      mean_gc      = round(mean(pct_gc, na.rm = TRUE), 1),
+      mean_dup     = round(mean(pct_duplicates, na.rm = TRUE), 1),
+      .groups      = "drop"
+    ) %>%
+    mutate(
+      mean_reads   = formatC(mean_reads,   format = "d", big.mark = ","),
+      median_reads = formatC(median_reads, format = "d", big.mark = ",")
+    )
+
+  blank_comparison %>%
+    kable(
+      col.names = c("Type", "N", "Mean Reads", "Median Reads",
+                    "Mean % GC", "Mean % Duplicates"),
+      align = "lrrrrr"
+    ) %>%
+    kable_styling(
+      bootstrap_options = c("striped", "hover", "condensed"),
+      full_width        = FALSE,
+      position          = "left"
+    ) %>%
+    print()
+}
+```
