@@ -31,4 +31,10 @@ echo "Merged table written to $AGG_DIR/metaphlan_merged.tsv"
 # ── copy markdown file  ───────────────────────────────────────────────────────
 cp scripts/02_taxonomic_report.Rmd $AGG_DIR
 
+# ── Copy fungal report if Kraken2 was run ─────────────────────────────────────
+if [[ "$RUN_KRAKEN" == true ]]; then
+    cp scripts/03_fungal_report.Rmd "$OUT_DIR/04_aggregated/"
+    echo "Fungal report template copied to $OUT_DIR/04_aggregated/"
+fi
+
 echo "Job done"; date

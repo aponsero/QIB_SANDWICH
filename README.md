@@ -1,10 +1,10 @@
-# SANDWICH : Sequencing ANalysis and Data Workflow for Integrated Characterisation of microbiomes
+# QIB Metagenomics Pipeline
 
 ## Overview
 
-This pipeline provides an end-to-end workflow for shotgun metagenomic analysis of paired-end sequencing data from food metagenomes. It is designed to run on the QIB HPC cluster using SLURM array jobs, with a modular step-by-step structure that allows users to control which analyses are run and to verify outputs between steps before proceeding.
+This pipeline provides an end-to-end workflow for shotgun metagenomic analysis of paired-end sequencing data. It is designed to run on the QIB HPC cluster using SLURM array jobs, with a modular step-by-step structure that allows users to control which analyses are run and to verify outputs between steps before proceeding.
 
-The pipeline covers host read removal (human and food matrix), quality control, taxonomic profiling, strain-level analysis, and functional annotation, with aggregated reports generated at each stage.
+The pipeline covers host read removal, quality control, taxonomic profiling, strain-level analysis, and functional annotation, with aggregated reports generated at each stage.
 
 ---
 
@@ -131,7 +131,7 @@ blank1       /path/blank1_R1      /path/blank1_R2      none
 sample3      /path/sample3_R1     /path/sample3_R2
 ```
 
-Valid values for `food_host` are: `cow`, `salmon`, `soybean`, `pig`, `spinach`, `none`. If the column is absent or the value is empty for a sample (as for `sample3` above), the pipeline falls back to `FOOD_HOST_REF` from `config.sh`. Use `none` explicitly for blank samples to skip food host removal.
+Valid values for `food_host` are: `cow`, `salmon`, `soybean`, `pig`, `spinach`, `chicken`, `pork-chicken`, `none`. If the column is absent or the value is empty for a sample (as for `sample3` above), the pipeline falls back to `FOOD_HOST_REF` from `config.sh`. Use `none` explicitly for blank samples to skip food host removal.
 
 ### 3. Edit the config file
 
@@ -148,7 +148,7 @@ Key settings to review:
 - `LOG_DIR` — where SLURM logs will be written
 - `TYPE` — sequencing type: `illumina` or `mgi`
 - `REMOVE_HUMAN` — set to `true` to remove human reads first (recommended for all food microbiome studies to control for operator contamination); set to `false` only if you are certain no human contamination is possible
-- `FOOD_HOST_REF` — food or environmental host to remove after human decontamination; options: `cow`, `salmon`, `soybean`, `pig`, `spinach`; set to `none` to skip this step
+- `FOOD_HOST_REF` — food or environmental host to remove after human decontamination; options: `cow`, `salmon`, `soybean`, `pig`, `spinach`, `chicken`, `pork-chicken`; set to `none` to skip this step. For mixed food products requiring removal of multiple host genomes simultaneously, a combined reference can be used (e.g. `pork-chicken` removes both pig and chicken reads in a single step). Contact the Bioinformatics Core if you need a combined reference built for a new food matrix combination.
 - Module switches (`RUN_METAPHLAN`, `RUN_KRAKEN`, `RUN_HUMANN`, `RUN_ARG`, `RUN_VIRULENCE`, `RUN_SAMESTR`)
 
 Database paths are pre-configured for the QIB cluster and should not need to be changed unless databases are updated.

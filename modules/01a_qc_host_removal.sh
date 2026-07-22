@@ -15,11 +15,11 @@ export HOSTILE_CACHE_DIR=$HOSTILE_CACHE_DIR
 echo "Job started"; hostname; date
 
 # ── Parse sample sheet ────────────────────────────────────────────────────────
-LINE=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" $SAMPLE_SHEET | tr -d '\r')
+LINE=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" $SAMPLE_SHEET)
 SAMPLE_ID=$(echo "$LINE" | awk '{print $1}')
 READ1=$(echo "$LINE"     | awk '{print $2}')
 READ2=$(echo "$LINE"     | awk '{print $3}')
-SAMPLE_FOOD_HOST=$(echo "$LINE" | awk '{print $4}' | tr -d '\r')
+SAMPLE_FOOD_HOST=$(echo "$LINE" | awk '{print $4}')
 
 # ── Resolve effective food host ───────────────────────────────────────────────
 # Priority: sample sheet column > config FOOD_HOST_REF > "none"
@@ -56,14 +56,16 @@ FASTQC_DIR="$QC_DIR/fastqc"
 # ── Food host index selection ─────────────────────────────────────────────────
 if [[ "$EFFECTIVE_FOOD_HOST" != "none" ]]; then
     case "$EFFECTIVE_FOOD_HOST" in
-        cow)     FOOD_INDEX="cow-argos985" ;;
-        salmon)  FOOD_INDEX="salmon-argos985" ;;
-        soybean) FOOD_INDEX="soybean-argos985" ;;
-        pig)     FOOD_INDEX="pig-argos985" ;;
-        spinach) FOOD_INDEX="spinach-argos985" ;;
+        cow)          FOOD_INDEX="cow-argos985" ;;
+        salmon)       FOOD_INDEX="salmon-argos985" ;;
+        soybean)      FOOD_INDEX="soybean-argos985" ;;
+        pig)          FOOD_INDEX="pig-argos985" ;;
+        spinach)      FOOD_INDEX="spinach-argos985" ;;
+        chicken)      FOOD_INDEX="chicken-argos985" ;;
+        pork-chicken) FOOD_INDEX="pork-chicken-argos985" ;;
         *)
             echo "ERROR: Unknown food host '$EFFECTIVE_FOOD_HOST' for sample $SAMPLE_ID."
-            echo "Choose: cow, salmon, soybean, pig, spinach, or none"
+            echo "Choose: cow, salmon, soybean, pig, spinach, chicken, pork-chicken, or none"
             exit 1
             ;;
     esac
